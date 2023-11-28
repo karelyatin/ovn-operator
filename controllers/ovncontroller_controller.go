@@ -465,7 +465,7 @@ func (r *OVNControllerReconciler) reconcileNormal(ctx context.Context, instance 
 		}
 	}
 
-	if sbCluster.Spec.NetworkAttachment != "" {
+	if sbCluster.Spec.Override.Service != nil {
 		// Create ConfigMap for external dataplane consumption
 		// TODO(ihar) - is there any hashing mechanism for EDP config? do we trigger deploy somehow?
 		err = r.generateExternalConfigMaps(ctx, helper, instance, sbCluster, &configMapVars)

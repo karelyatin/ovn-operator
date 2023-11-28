@@ -38,7 +38,6 @@ func StatefulSet(
 	instance *ovnv1.OVNDBCluster,
 	configHash string,
 	labels map[string]string,
-	annotations map[string]string,
 ) *appsv1.StatefulSet {
 	runAsUser := int64(0)
 
@@ -128,8 +127,7 @@ func StatefulSet(
 			Replicas:    instance.Spec.Replicas,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Annotations: annotations,
-					Labels:      labels,
+					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: instance.RbacResourceName(),

@@ -12,6 +12,7 @@ func Service(
 	serviceName string,
 	instance *ovnv1.OVNDBCluster,
 	serviceLabels map[string]string,
+	selectorLabels map[string]string,
 ) *corev1.Service {
 	dbPortName := "north"
 	raftPortName := "north-raft"
@@ -30,7 +31,7 @@ func Service(
 			Labels:    serviceLabels,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: serviceLabels,
+			Selector: selectorLabels,
 			Ports: []corev1.ServicePort{
 				{
 					Name:     dbPortName,

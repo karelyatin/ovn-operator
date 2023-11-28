@@ -36,7 +36,6 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/env"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
-	nad "github.com/openstack-k8s-operators/lib-common/modules/common/networkattachment"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/statefulset"
@@ -280,7 +279,7 @@ func (r *OVNDBClusterReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 
 	// network to attach to
-	networkAttachments := []string{}
+	/*networkAttachments := []string{}
 	if instance.Spec.NetworkAttachment != "" {
 		networkAttachments = append(networkAttachments, instance.Spec.NetworkAttachment)
 
@@ -310,7 +309,7 @@ func (r *OVNDBClusterReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, fmt.Errorf("failed create network annotation from %s: %w",
 			instance.Spec.NetworkAttachment, err)
 	}
-
+	*/
 	// ConfigMap
 	configMapVars := make(map[string]env.Setter)
 
@@ -374,7 +373,7 @@ func (r *OVNDBClusterReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 	// Define a new Statefulset object
 	sfset := statefulset.NewStatefulSet(
-		ovndbcluster.StatefulSet(instance, inputHash, serviceLabels, serviceAnnotations),
+		ovndbcluster.StatefulSet(instance, inputHash, serviceLabels),
 		time.Duration(5)*time.Second,
 	)
 
@@ -397,27 +396,6 @@ func (r *OVNDBClusterReconciler) reconcileNormal(ctx context.Context, instance *
 	}
 
 	instance.Status.ReadyCount = sfset.GetStatefulSet().Status.ReadyReplicas
-
-	// verify if network attachment matches expectations
-	networkReady, networkAttachmentStatus, err := nad.VerifyNetworkStatusFromAnnotation(ctx, helper, networkAttachments, serviceLabels, instance.Status.ReadyCount)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	instance.Status.NetworkAttachments = networkAttachmentStatus
-	if networkReady {
-		instance.Status.Conditions.MarkTrue(condition.NetworkAttachmentsReadyCondition, condition.NetworkAttachmentsReadyMessage)
-	} else {
-		err := fmt.Errorf("not all pods have interfaces with ips as configured in NetworkAttachments: %s", instance.Spec.NetworkAttachment)
-		instance.Status.Conditions.Set(condition.FalseCondition(
-			condition.NetworkAttachmentsReadyCondition,
-			condition.ErrorReason,
-			condition.SeverityWarning,
-			condition.NetworkAttachmentsReadyErrorMessage,
-			err.Error()))
-
-		return ctrlResult, nil
-	}
 
 	// create Statefulset - end
 	// Handle service init
@@ -470,21 +448,23 @@ func (r *OVNDBClusterReconciler) reconcileNormal(ctx context.Context, instance *
 				// Test using hostname instead of ip for dbAddress connection
 				//serviceHostname := fmt.Sprintf("%s.%s.svc", svc.Name, svc.GetNamespace())
 				//dbAddress = append(dbAddress, fmt.Sprintf("tcp:%s:%d", serviceHostname, svc.Spec.Ports[0].Port))
-
+				if svc.Spec.Type == corev1.ServiceTypeLoadBalancer {
+					dbAddress = append(dbAddress, fmt.Sprintf("tcp:%s:%d", svc.Annotations[service.MetalLBLoadBalancerIPs], svcPort))
+				}
 				internalDbAddress = append(internalDbAddress, fmt.Sprintf("tcp:%s:%d", svc.Spec.ClusterIP, svcPort))
 				raftAddress = append(raftAddress, fmt.Sprintf("tcp:%s:%d", svc.Spec.ClusterIP, svc.Spec.Ports[1].Port))
 			}
 		}
 
 		// External dbAddress if networkAttachment is used
-		if instance.Spec.NetworkAttachment != "" {
+		/*if instance.Spec.NetworkAttachment != "" {
 			net := instance.Namespace + "/" + instance.Spec.NetworkAttachment
 			if netStat, ok := instance.Status.NetworkAttachments[net]; ok {
 				for _, instanceIP := range netStat {
 					dbAddress = append(dbAddress, fmt.Sprintf("tcp:%s:%d", instanceIP, svcPort))
 				}
 			}
-		}
+		}*/
 
 		// Set DB Addresses
 		instance.Status.InternalDBAddress = strings.Join(internalDbAddress, ",")
@@ -527,60 +507,49 @@ func (r *OVNDBClusterReconciler) reconcileServices(
 		return ctrl.Result{}, nil
 	}
 
-	podList, err := ovndbcluster.OVNDBPods(ctx, instance, helper, serviceLabels)
+	ovndbServiceLabels := map[string]string{
+		common.AppSelector: serviceName,
+	}
+	exportLabels := util.MergeStringMaps(
+		ovndbServiceLabels,
+		map[string]string{
+			service.AnnotationEndpointKey: string(service.EndpointInternal),
+		},
+	)
+	svcOverride := instance.Spec.Override.Service[service.EndpointInternal]
+	svc, err := service.NewService(
+		ovndbcluster.Service(serviceName+"-ext", instance, exportLabels, ovndbServiceLabels),
+		time.Duration(5)*time.Second,
+		&svcOverride.OverrideSpec,
+	)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-
-	for _, ovnPod := range podList.Items {
-		//
-		// Create the ovndbcluster pod service if none exists
-		//
-		ovndbServiceLabels := map[string]string{
-			common.AppSelector:                   serviceName,
-			"statefulset.kubernetes.io/pod-name": ovnPod.Name,
-		}
-		svc, err := service.NewService(
-			ovndbcluster.Service(ovnPod.Name, instance, ovndbServiceLabels),
-			time.Duration(5)*time.Second,
-			nil,
-		)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		ctrlResult, err := svc.CreateOrPatch(ctx, helper)
-		if err != nil {
-			return ctrl.Result{}, err
-		} else if (ctrlResult != ctrl.Result{}) {
-			return ctrl.Result{}, nil
-		}
-		// create service - end
-	}
-
-	// Delete any extra services left after scale down
-	svcList, err := service.GetServicesListWithLabel(
-		ctx,
-		helper,
-		helper.GetBeforeObject().GetNamespace(),
-		serviceLabels,
-	)
-	if err == nil && len(svcList.Items) > int(*(instance.Spec.Replicas)) {
-		for i := len(svcList.Items) - 1; i >= int(*(instance.Spec.Replicas)); i-- {
-			svcLabels := map[string]string{
-				common.AppSelector:                   serviceName,
-				"statefulset.kubernetes.io/pod-name": serviceName + fmt.Sprintf("-%d", i),
-			}
-			err = service.DeleteServicesWithLabel(
-				ctx,
-				helper,
-				instance,
-				svcLabels,
-			)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
+	svc.AddAnnotation(map[string]string{
+		service.AnnotationEndpointKey: string(service.EndpointInternal),
+	})
+	if svc.GetServiceType() == corev1.ServiceTypeClusterIP {
+		svc.AddAnnotation(map[string]string{
+			service.AnnotationIngressCreateKey: "true",
+		})
+	} else {
+		svc.AddAnnotation(map[string]string{
+			service.AnnotationIngressCreateKey: "false",
+		})
+		if svc.GetServiceType() == corev1.ServiceTypeLoadBalancer {
+			svc.AddAnnotation(map[string]string{
+				service.AnnotationHostnameKey: svc.GetServiceHostname(), // add annotation to register service name in dnsmasq
+			})
 		}
 	}
+	ctrlResult, err = svc.CreateOrPatch(ctx, helper)
+	if err != nil {
+		return ctrl.Result{}, err
+	} else if (ctrlResult != ctrl.Result{}) {
+		return ctrl.Result{}, nil
+	}
+	// create service - end
+
 	Log.Info("Reconciled OVN DB Cluster Service successfully")
 	return ctrl.Result{}, nil
 }
