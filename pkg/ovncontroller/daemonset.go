@@ -35,7 +35,7 @@ func CreateOVNDaemonSet(
 	mounts := GetOVNControllerVolumeMounts()
 
 	cmd := []string{
-		"ovn-controller", "--pidfile", "unix:/run/openvswitch/db.sock",
+		"ovn-controller", "--pidfile", "unix:/run/openvswitch/db.sock", "--log-file=/var/log/ovn/ovn-controller.log",
 	}
 
 	// add OVN dbs cert and CA
@@ -75,7 +75,7 @@ func CreateOVNDaemonSet(
 			Lifecycle: &corev1.Lifecycle{
 				PreStop: &corev1.LifecycleHandler{
 					Exec: &corev1.ExecAction{
-						Command: []string{"/usr/share/ovn/scripts/ovn-ctl", "stop_controller"},
+						Command: []string{"/usr/local/bin/container-scripts/stop-ovn-controller.sh"},
 					},
 				},
 			},

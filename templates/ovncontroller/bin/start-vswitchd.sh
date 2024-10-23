@@ -30,7 +30,7 @@ ovs-vsctl --no-wait set open_vswitch . other_config:flow-restore-wait=true
 
 # It's safe to start vswitchd now. Do it.
 # --detach to allow the execution to continue to restoring the flows.
-/usr/sbin/ovs-vswitchd --pidfile --mlockall --detach
+/usr/sbin/ovs-vswitchd --pidfile --mlockall --detach --log-file
 
 # Restore saved flows.
 if [ -f $FLOWS_RESTORE_SCRIPT ]; then
