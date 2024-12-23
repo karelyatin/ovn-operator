@@ -22,15 +22,15 @@ wait_for_ovsdb_server
 set -ex
 
 # Configure encap IP.
-OVNEncapIP=$(ip -o addr show dev {{ .OVNEncapNIC }} scope global | awk '{print $4}' | cut -d/ -f1)
-ovs-vsctl --no-wait set open . external-ids:ovn-encap-ip=${OVNEncapIP}
+OVNEncapIP=$(ip netns exec ospnetns ip -o addr show dev tenant scope global | awk '{print $4}' | cut -d/ -f1)
+ip netns exec ospnetns ovs-vsctl --no-wait set open . external-ids:ovn-encap-ip=${OVNEncapIP}
 
 # Before starting vswitchd, block it from flushing existing datapath flows.
-ovs-vsctl --no-wait set open_vswitch . other_config:flow-restore-wait=true
+ip netns exec ospnetns ovs-vsctl --no-wait set open_vswitch . other_config:flow-restore-wait=true
 
 # It's safe to start vswitchd now. Do it.
 # --detach to allow the execution to continue to restoring the flows.
-/usr/sbin/ovs-vswitchd --pidfile --mlockall --detach
+ip netns exec ospnetns /usr/sbin/ovs-vswitchd --pidfile --mlockall --detach --log-file
 
 # Restore saved flows.
 if [ -f $FLOWS_RESTORE_SCRIPT ]; then

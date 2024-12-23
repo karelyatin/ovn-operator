@@ -23,11 +23,20 @@ EnableChassisAsGateway=${EnableChassisAsGateway:-true}
 PhysicalNetworks=${PhysicalNetworks:-""}
 OVNHostName=${OVNHostName:-""}
 DB_FILE=/etc/openvswitch/conf.db
+NETNS=${NETNS:-"ospnetns"}
 
 ovs_dir=/var/lib/openvswitch
 FLOWS_RESTORE_SCRIPT=$ovs_dir/flows-script
 FLOWS_RESTORE_DIR=$ovs_dir/saved-flows
 SAFE_TO_STOP_OVSDB_SERVER_SEMAPHORE=$ovs_dir/is_safe_to_stop_ovsdb_server
+OVN_CONTROLLER_CLEANUP_CHASSIS_FLAG=$ovs_dir/cleanup_chassis
+
+function ovn_controller_is_restarting() {
+    if [ ! -f $OVN_CONTROLLER_CLEANUP_CHASSIS_FLAG ]; then
+        return 0
+    fi
+    return 1
+}
 
 function cleanup_ovsdb_server_semaphore() {
     rm -f $SAFE_TO_STOP_OVSDB_SERVER_SEMAPHORE 2>&1 > /dev/null
@@ -40,7 +49,7 @@ function cleanup_flows_backup() {
 
 function wait_for_ovsdb_server {
     while true; do
-        /usr/bin/ovs-vsctl show
+        ip netns exec ${NETNS} /usr/bin/ovs-vsctl show
         if [ $? -eq 0 ]; then
             break
         else
@@ -52,23 +61,24 @@ function wait_for_ovsdb_server {
 
 # configure external-ids in OVS
 function configure_external_ids {
-    ovs-vsctl set open . external-ids:ovn-bridge=${OVNBridge}
-    ovs-vsctl set open . external-ids:ovn-remote=${OVNRemote}
-    ovs-vsctl set open . external-ids:ovn-encap-type=${OVNEncapType}
+    ip netns exec ${NETNS} ovs-vsctl set open . external-ids:ovn-bridge=${OVNBridge}
+    ip netns exec ${NETNS} ovs-vsctl set open . external-ids:ovn-remote=${OVNRemote}
+    ip netns exec ${NETNS} ovs-vsctl set open . external-ids:ovn-encap-type=${OVNEncapType}
+    ip netns exec ${NETNS} ovs-vsctl set open . external-ids:ovn-ofctrl-wait-before-clear="60"
     if [ -n "$OVNHostName" ]; then
-        ovs-vsctl set open . external-ids:hostname=${OVNHostName}
+        ip netns exec ${NETNS} ovs-vsctl set open . external-ids:hostname=${OVNHostName}
     fi
     local cms_options=""
-    if [ "$EnableChassisAsGateway" == "true" ]; then
+    if [[ "$EnableChassisAsGateway" == "true" && "$OVNHostName" == "master-0" ]]; then
         cms_options="enable-chassis-as-gw"
     fi
     if [ -n "$OVNAvailabilityZones" ]; then
         cms_options+=",availability-zones="$OVNAvailabilityZones
     fi
     if [ -n "${cms_options}" ]; then
-        ovs-vsctl set open . external-ids:ovn-cms-options=${cms_options#,}
+        ip netns exec ${NETNS} ovs-vsctl set open . external-ids:ovn-cms-options=${cms_options#,}
     else
-        ovs-vsctl --if-exists remove open . external_ids ovn-cms-options
+        ip netns exec ${NETNS} ovs-vsctl --if-exists remove open . external_ids ovn-cms-options
     fi
 }
 
@@ -79,9 +89,20 @@ function set_difference {
 
 # Configure bridge mappings and physical bridges
 function configure_physical_networks {
+    if ! ip netns list | grep -q "$NETNS"; then
+        ip netns add ${NETNS} || true
+    fi
     local OVNBridgeMappings=""
     local br_new=""
-    for physicalNetwork in ${PhysicalNetworks}; do
+    IFS=';' read -r -a PhysicalNetworks <<< "$PhysicalNetworks"
+    for physicalNetwork in "${PhysicalNetworks[@]}"; do
+        IFS='=' read -r physicalNetwork nic <<< "$physicalNetwork"
+        if ! ip link show ${physicalNetwork}-host &> /dev/null; then
+            ip link add ${physicalNetwork} netns ${NETNS} type veth peer name ${physicalNetwork}-host
+            ip link set ${physicalNetwork}-host master ${nic}
+            ip netns exec ${NETNS} ip link set ${physicalNetwork} up
+            ip link set ${physicalNetwork}-host up
+	fi
         br_name="br-${physicalNetwork}"
         bridgeMapping="${physicalNetwork}:${br_name}"
         if [ -z "$OVNBridgeMappings" ]; then
@@ -94,10 +115,10 @@ function configure_physical_networks {
     done
 
     # Current configured bridges.
-    ovn_bms=$(ovs-vsctl --if-exists get open . external_ids:ovn-bridge-mappings|tr -d '"')
+    ovn_bms=$(ip netns exec ${NETNS} ovs-vsctl --if-exists get open . external_ids:ovn-bridge-mappings|tr -d '"')
     local br_current=""
     for bm in ${ovn_bms/,/ }; do
-        if [ -z "$br_current"]; then
+        if [ -z "$br_current" ]; then
             br_current=${bm##*:}
         else
             br_current="${br_current} ${bm##*:}"
@@ -112,8 +133,8 @@ function configure_physical_networks {
 
     # Add the new bridges.
     for br_name in ${br_to_add}; do
-        ovs-vsctl --may-exist add-br ${br_name}
-        ovs-vsctl --may-exist add-port ${br_name} ${br_name#*-}
+        ip netns exec ${NETNS} ovs-vsctl --may-exist add-br ${br_name}
+        ip netns exec ${NETNS} ovs-vsctl --may-exist add-port ${br_name} ${br_name#*-}
     done
 
     # Delete the old bridges not longer present in "OVNBridgeMappings" and the
@@ -125,23 +146,23 @@ function configure_physical_networks {
         #   $ ovs-vsctl --column=options --bare find interface name=patch-provnet1-to-br-int type=patch
         #     peer=patch-br-int-to-provnet1
 
-        if ovs-vsctl br-exists ${br_name}; then
-            for iface in $(ovs-vsctl list-ifaces ${br_name}); do
-                port_type=$(ovs-vsctl --column=type --bare list interface ${iface})
+        if ip netns exec ${NETNS} ovs-vsctl br-exists ${br_name}; then
+            for iface in $(ip netns exec ${NETNS} ovs-vsctl list-ifaces ${br_name}); do
+                port_type=$(ip netns exec ${NETNS} ovs-vsctl --column=type --bare list interface ${iface})
                 if [ "$port_type" == "patch" ]; then
-                    peer=$(ovs-vsctl get interface ${iface} options:peer)
-                    ovs-vsctl --if-exists del-port ${OVNBridge} ${peer}
+                    peer=$(ip netns exec ${NETNS} ovs-vsctl get interface ${iface} options:peer)
+                    ip netns exec ${NETNS} ovs-vsctl --if-exists del-port ${OVNBridge} ${peer}
                 fi
             done
-            ovs-vsctl --if-exists del-br ${br_name}
+            ip netns exec ${NETNS} ovs-vsctl --if-exists del-br ${br_name}
         fi
     done
 
     # Set or remove the local OVS Open vSwitch "external-ids:ovn-bridge-mappings"
     if [ -n "$OVNBridgeMappings" ]; then
-        ovs-vsctl set open . external-ids:ovn-bridge-mappings=${OVNBridgeMappings}
+        ip netns exec ${NETNS} ovs-vsctl set open . external-ids:ovn-bridge-mappings=${OVNBridgeMappings}
     else
-        ovs-vsctl --if-exists remove open . external_ids ovn-bridge-mappings
+        ip netns exec ${NETNS} ovs-vsctl --if-exists remove open . external_ids ovn-bridge-mappings
     fi
 
 }

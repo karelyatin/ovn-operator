@@ -32,9 +32,13 @@ func getPhysicalNetworks(
 	// NOTE(slaweq): interface names aren't important as inside Pod they will be
 	//               named based on the NicMappings keys
 	// Need to pass sorted data as Map is unordered
-	nicMappings := maps.Keys(instance.Spec.NicMappings)
-	sort.Strings(nicMappings)
-	return strings.Join(nicMappings, " ")
+	nets := maps.Keys(instance.Spec.NicMappings)
+	sort.Strings(nets)
+	var nicMappings []string
+	for _, net := range nets {
+		nicMappings = append(nicMappings, fmt.Sprintf("%s=%s", net, instance.Spec.NicMappings[net]))
+	}
+	return strings.Join(nicMappings, ";")
 }
 
 func getOVNControllerPods(

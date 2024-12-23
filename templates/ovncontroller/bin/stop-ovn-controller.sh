@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Copyright 2023 Red Hat Inc.
+# Copyright 2024 Red Hat Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -17,13 +17,9 @@
 set -ex
 source $(dirname $0)/functions
 
-# Remove the obsolete semaphore file in case it still exists.
-cleanup_ovsdb_server_semaphore
+OPTS=
+if ovn_controller_is_restarting; then
+    OPTS+="--restart"
+fi
 
-# Start the service
-ip netns exec ospnetns ovsdb-server ${DB_FILE} \
-    --pidfile \
-    --remote=punix:/var/run/openvswitch/db.sock \
-    --private-key=db:Open_vSwitch,SSL,private_key \
-    --certificate=db:Open_vSwitch,SSL,certificate \
-    --bootstrap-ca-cert=db:Open_vSwitch,SSL,ca_cert
+/usr/share/ovn/scripts/ovn-ctl stop_controller $OPTS

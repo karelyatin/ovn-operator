@@ -32,6 +32,15 @@ func GetOVNControllerVolumes(name string, namespace string) []corev1.Volume {
 			},
 		},
 		{
+			Name: "var-run-netns",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: fmt.Sprintf("/var/run/netns"),
+					Type: &directoryOrCreate,
+				},
+			},
+		},
+		{
 			Name: "var-log",
 			VolumeSource: corev1.VolumeSource{
 				HostPath: &corev1.HostPathVolumeSource{
@@ -108,6 +117,15 @@ func GetOVSVolumes(name string, namespace string) []corev1.Volume {
 			},
 		},
 		{
+			Name: "var-run-netns",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: fmt.Sprintf("/var/run/netns"),
+					Type: &directoryOrCreate,
+				},
+			},
+		},
+		{
 			Name: "var-log",
 			VolumeSource: corev1.VolumeSource{
 				HostPath: &corev1.HostPathVolumeSource{
@@ -154,6 +172,11 @@ func GetOVSDbVolumeMounts() []corev1.VolumeMount {
 			ReadOnly:  false,
 		},
 		{
+			Name:      "var-run-netns",
+			MountPath: "/var/run/netns",
+			ReadOnly:  false,
+		},
+		{
 			Name:      "var-log",
 			MountPath: "/var/log/openvswitch",
 			ReadOnly:  false,
@@ -180,6 +203,11 @@ func GetVswitchdVolumeMounts() []corev1.VolumeMount {
 			ReadOnly:  false,
 		},
 		{
+			Name:      "var-run-netns",
+			MountPath: "/var/run/netns",
+			ReadOnly:  false,
+		},
+		{
 			Name:      "var-log",
 			MountPath: "/var/log/openvswitch",
 			ReadOnly:  false,
@@ -203,6 +231,11 @@ func GetOVNControllerVolumeMounts() []corev1.VolumeMount {
 		{
 			Name:      "var-run",
 			MountPath: "/var/run/openvswitch",
+			ReadOnly:  false,
+		},
+		{
+			Name:      "var-run-netns",
+			MountPath: "/var/run/netns",
 			ReadOnly:  false,
 		},
 		{

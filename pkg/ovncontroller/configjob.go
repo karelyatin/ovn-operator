@@ -78,6 +78,7 @@ func ConfigJob(
 					TTLSecondsAfterFinished: &jobTTLAfterFinished,
 					Template: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
+							HostNetwork:        true,
 							RestartPolicy:      corev1.RestartPolicyOnFailure,
 							ServiceAccountName: instance.RbacResourceName(),
 							Containers: []corev1.Container{
