@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"k8s.io/apimachinery/pkg/fields"
@@ -44,14 +45,17 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 	ovnv1 "github.com/openstack-k8s-operators/ovn-operator/api/v1beta1"
+	ovn_common "github.com/openstack-k8s-operators/ovn-operator/pkg/common"
 	"github.com/openstack-k8s-operators/ovn-operator/pkg/ovnnorthd"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // OVNNorthdReconciler reconciles a OVNNorthd object
@@ -83,6 +87,8 @@ func (r *OVNNorthdReconciler) GetLogger(ctx context.Context) logr.Logger {
 //+kubebuilder:rbac:groups=ovn.openstack.org,resources=ovndbclusters/status,verbs=get;list;watch;
 //+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete;
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete;
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete;
+//+kubebuilder:rbac:groups=core,resources=endpoints,verbs=get;list;watch;create;update;patch;delete;
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;patch;update;delete;
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;
 
@@ -237,6 +243,8 @@ func (r *OVNNorthdReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&ovnv1.OVNNorthd{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.Endpoints{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
@@ -534,6 +542,21 @@ func (r *OVNNorthdReconciler) reconcileNormal(ctx context.Context, instance *ovn
 	}
 	// create Deployment - end
 
+	// Create per-pod metrics services if metrics are enabled
+	if instance.Spec.MetricsEnabled == nil || *instance.Spec.MetricsEnabled {
+		ctrlResult, err = r.reconcileMetricsServices(ctx, helper, instance, serviceLabels)
+		if err != nil {
+			Log.Error(err, "Failed to reconcile metrics services")
+			return ctrlResult, err
+		} else if (ctrlResult != ctrl.Result{}) {
+			Log.Info("Metrics services reconciliation in progress")
+			return ctrlResult, nil
+		}
+	} else {
+		// Metrics are explicitly disabled, clean up any existing metrics services
+		r.cleanupExtraStaticServices(ctx, instance, 0, Log)
+	}
+
 	Log.Info("Reconciled Service successfully")
 	return ctrl.Result{}, nil
 }
@@ -566,6 +589,9 @@ func (r *OVNNorthdReconciler) generateServiceConfigMaps(
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(serviceName), map[string]string{})
 
 	templateParameters := make(map[string]interface{})
+	templateParameters["TLS"] = instance.Spec.TLS.Enabled()
+	templateParameters["OVN_METRICS_CERT_PATH"] = ovn_common.OVNMetricsCertPath
+	templateParameters["OVN_METRICS_KEY_PATH"] = ovn_common.OVNMetricsKeyPath
 
 	cms := []util.Template{
 		// ScriptsConfigMap
@@ -577,6 +603,277 @@ func (r *OVNNorthdReconciler) generateServiceConfigMaps(
 			Labels:        cmLabels,
 			ConfigOptions: templateParameters,
 		},
+		// ConfigConfigMap for network exporter
+		{
+			Name:          fmt.Sprintf("%s-config", instance.Name),
+			Namespace:     instance.Namespace,
+			Type:          util.TemplateTypeConfig,
+			InstanceType:  instance.Kind,
+			Labels:        cmLabels,
+			ConfigOptions: templateParameters,
+		},
 	}
 	return configmap.EnsureConfigMaps(ctx, h, instance, cms, envVars)
+}
+
+// reconcileMetricsServices creates static metrics services with consistent pod assignment
+func (r *OVNNorthdReconciler) reconcileMetricsServices(
+	ctx context.Context,
+	helper *helper.Helper,
+	instance *ovnv1.OVNNorthd,
+	serviceLabels map[string]string,
+) (ctrl.Result, error) {
+	Log := r.GetLogger(ctx)
+
+	// Get the desired number of replicas from the instance
+	desiredReplicas := int32(0)
+	if instance.Spec.Replicas != nil {
+		desiredReplicas = *instance.Spec.Replicas
+	}
+
+	// List running pods for this OVN Northd instance
+	podList := &corev1.PodList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels(map[string]string{
+			common.AppSelector: ovnv1.ServiceNameOVNNorthd,
+		}),
+	}
+	err := r.Client.List(ctx, podList, listOpts...)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	// Get running pods (exclude terminating pods and pods without IP)
+	runningPods := make([]*corev1.Pod, 0, len(podList.Items))
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		isTerminating := pod.DeletionTimestamp != nil
+		isReady := false
+		// Check if pod is ready by examining readiness conditions
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+				isReady = true
+				break
+			}
+		}
+
+		// Additional validation: pod must be running, ready, have IP, and be stable for a bit
+		if pod.Status.Phase == corev1.PodRunning && !isTerminating && isReady && pod.Status.PodIP != "" {
+			// Check if pod has been ready for at least 5 seconds to ensure stability
+			now := time.Now()
+			for _, condition := range pod.Status.Conditions {
+				if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+					if condition.LastTransitionTime.Add(5 * time.Second).Before(now) {
+						runningPods = append(runningPods, pod)
+					} else {
+						Log.Info(fmt.Sprintf("Pod %s is ready but too recent, waiting for stability", pod.Name))
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// Sort pods by creation timestamp for consistent assignment
+	sort.Slice(runningPods, func(i, j int) bool {
+		return runningPods[i].CreationTimestamp.Before(&runningPods[j].CreationTimestamp)
+	})
+
+	// Create static metrics services based on desired replica count
+	for i := int32(0); i < desiredReplicas; i++ {
+		serviceName := fmt.Sprintf("ovn-northd-metrics-%d", i)
+
+		// Create service without selector (headless service)
+		staticService := r.createStaticMetricsService(instance, serviceLabels, serviceName, i)
+
+		metricsService, err := service.NewService(
+			staticService,
+			time.Duration(5)*time.Second,
+			nil,
+		)
+		if err != nil {
+			Log.Error(err, fmt.Sprintf("Failed to create static metrics service %s", serviceName))
+			continue
+		}
+		ctrlResult, err := metricsService.CreateOrPatch(ctx, helper)
+		if err != nil {
+			Log.Error(err, fmt.Sprintf("Failed to create or patch static metrics service %s", serviceName))
+			// Return error to trigger requeue instead of continuing, allowing rate limiter to back off
+			return ctrl.Result{}, err
+		} else if (ctrlResult != ctrl.Result{}) {
+			Log.Info(fmt.Sprintf("Static metrics service creation in progress: %s", serviceName))
+			return ctrlResult, nil
+		}
+
+		// For per-pod services, update the service selector to point to the specific pod
+		if int(i) < len(runningPods) {
+			pod := runningPods[int(i)]
+			err = r.updateServiceSelector(ctx, instance, serviceName, pod, Log)
+			if err != nil {
+				Log.Error(err, fmt.Sprintf("Failed to update selector for service %s", serviceName))
+				return ctrl.Result{}, err
+			}
+			Log.Info(fmt.Sprintf("Updated service %s to route to pod %s", serviceName, pod.Name))
+		} else {
+			Log.Info(fmt.Sprintf("No pod available for service %s (replica index %d)", serviceName, i))
+		}
+
+		Log.Info(fmt.Sprintf("Successfully reconciled static metrics service: %s", serviceName))
+	}
+
+	// Clean up extra services if we scaled down
+	r.cleanupExtraStaticServices(ctx, instance, desiredReplicas, Log)
+
+	return ctrl.Result{}, nil
+}
+
+// createStaticMetricsService creates a static metrics service with predictable naming
+func (r *OVNNorthdReconciler) createStaticMetricsService(
+	instance *ovnv1.OVNNorthd,
+	serviceLabels map[string]string,
+	serviceName string,
+	replicaIndex int32,
+) *corev1.Service {
+	// Add type label for metrics service and replica index
+	svcLabels := util.MergeMaps(serviceLabels, map[string]string{
+		"type":          "metrics",
+		"replica-index": fmt.Sprintf("%d", replicaIndex),
+	})
+
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: instance.Namespace,
+			Labels:    svcLabels,
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{
+					Name:     "metrics",
+					Port:     1981,
+					Protocol: corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+
+	// Use selector-based service for universal compatibility
+	// For per-pod services, we need to determine which pod this service should route to
+	// We'll set the selector after we know which pod is assigned to this replica index
+
+	if service.Annotations == nil {
+		service.Annotations = make(map[string]string)
+	}
+	service.Annotations["ovn.openstack.org/endpoint-mode"] = "automatic"
+
+	return service
+}
+
+// updateServiceSelector updates a service to route to a specific pod
+func (r *OVNNorthdReconciler) updateServiceSelector(
+	ctx context.Context,
+	instance *ovnv1.OVNNorthd,
+	serviceName string,
+	pod *corev1.Pod,
+	Log logr.Logger,
+) error {
+	// Get the existing service
+	svc := &corev1.Service{}
+	err := r.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: instance.Namespace}, svc)
+	if err != nil {
+		return fmt.Errorf("failed to get service %s: %w", serviceName, err)
+	}
+
+	// Set selector to route to the specific pod
+	if svc.Spec.Selector == nil {
+		svc.Spec.Selector = make(map[string]string)
+	}
+
+	// For deployment pods, we need to create a unique selector per pod
+	// Since deployment pods don't have unique labels by default, we'll add one
+	svc.Spec.Selector = map[string]string{
+		common.AppSelector:              ovnv1.ServiceNameOVNNorthd,
+		"ovn.openstack.org/metrics-pod": pod.Name, // Use pod name as unique identifier
+	}
+
+	// We also need to ensure the pod has this label for the selector to work
+	err = r.ensurePodHasMetricsLabel(ctx, pod, Log)
+	if err != nil {
+		return fmt.Errorf("failed to add metrics label to pod %s: %w", pod.Name, err)
+	}
+
+	// Update the service
+	err = r.Client.Update(ctx, svc)
+	if err != nil {
+		return fmt.Errorf("failed to update service %s selector: %w", serviceName, err)
+	}
+
+	return nil
+}
+
+// ensurePodHasMetricsLabel adds a unique metrics label to a pod for service targeting
+func (r *OVNNorthdReconciler) ensurePodHasMetricsLabel(
+	ctx context.Context,
+	pod *corev1.Pod,
+	Log logr.Logger,
+) error {
+	// Check if the pod already has the metrics label
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
+
+	expectedLabel := "ovn.openstack.org/metrics-pod"
+	if pod.Labels[expectedLabel] == pod.Name {
+		// Pod already has the correct label
+		return nil
+	}
+
+	// Add the label to the pod
+	pod.Labels[expectedLabel] = pod.Name
+
+	err := r.Client.Update(ctx, pod)
+	if err != nil {
+		return fmt.Errorf("failed to update pod %s with metrics label: %w", pod.Name, err)
+	}
+
+	Log.Info(fmt.Sprintf("Added metrics label to pod %s", pod.Name))
+	return nil
+}
+
+// cleanupExtraStaticServices removes services beyond the desired replica count
+func (r *OVNNorthdReconciler) cleanupExtraStaticServices(
+	ctx context.Context,
+	instance *ovnv1.OVNNorthd,
+	desiredReplicas int32,
+	Log logr.Logger,
+) {
+	// Look for services with indices >= desiredReplicas
+	for i := desiredReplicas; i < 32; i++ { // Check up to max replicas (32)
+		serviceName := fmt.Sprintf("ovn-northd-metrics-%d", i)
+
+		// Try to delete service
+		svc := &corev1.Service{}
+		err := r.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: instance.Namespace}, svc)
+		if err == nil {
+			// Service exists, delete it
+			Log.Info(fmt.Sprintf("Deleting extra static service %s (scaled down)", serviceName))
+			err = r.Client.Delete(ctx, svc)
+			if err != nil && !k8s_errors.IsNotFound(err) {
+				Log.Error(err, fmt.Sprintf("Failed to delete extra service %s", serviceName))
+			}
+		}
+
+		// Try to delete endpoints
+		ep := &corev1.Endpoints{}
+		err = r.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: instance.Namespace}, ep)
+		if err == nil {
+			// Endpoints exist, delete them
+			Log.Info(fmt.Sprintf("Deleting extra static endpoints %s (scaled down)", serviceName))
+			err = r.Client.Delete(ctx, ep)
+			if err != nil && !k8s_errors.IsNotFound(err) {
+				Log.Error(err, fmt.Sprintf("Failed to delete extra endpoints %s", serviceName))
+			}
+		}
+	}
 }

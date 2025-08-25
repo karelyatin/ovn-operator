@@ -13,3 +13,5 @@ status:
   containerStatuses:
     - name: ovn-northd
       restartCount: 1
+    - name: openstack-network-exporter
+      restartCount: 0

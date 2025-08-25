@@ -14,3 +14,5 @@ status:
   containerStatuses:
     - name: ovn-northd
       ready: true
+    - name: openstack-network-exporter
+      ready: true
