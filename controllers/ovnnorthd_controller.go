@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/fields"
@@ -44,14 +45,17 @@ import (
 	"github.com/openstack-k8s-operators/lib-common/modules/common/helper"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/labels"
 	common_rbac "github.com/openstack-k8s-operators/lib-common/modules/common/rbac"
+	"github.com/openstack-k8s-operators/lib-common/modules/common/service"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/tls"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/util"
 	ovnv1 "github.com/openstack-k8s-operators/ovn-operator/api/v1beta1"
+	ovn_common "github.com/openstack-k8s-operators/ovn-operator/pkg/common"
 	"github.com/openstack-k8s-operators/ovn-operator/pkg/ovnnorthd"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	k8s_errors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // OVNNorthdReconciler reconciles a OVNNorthd object
@@ -83,6 +87,8 @@ func (r *OVNNorthdReconciler) GetLogger(ctx context.Context) logr.Logger {
 //+kubebuilder:rbac:groups=ovn.openstack.org,resources=ovndbclusters/status,verbs=get;list;watch;
 //+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete;
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete;
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete;
+//+kubebuilder:rbac:groups=core,resources=endpoints,verbs=get;list;watch;create;update;patch;delete;
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;patch;update;delete;
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;
 
@@ -237,6 +243,8 @@ func (r *OVNNorthdReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&ovnv1.OVNNorthd{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.Endpoints{}).
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
@@ -534,6 +542,18 @@ func (r *OVNNorthdReconciler) reconcileNormal(ctx context.Context, instance *ovn
 	}
 	// create Deployment - end
 
+	// Create per-pod metrics services if metrics are enabled
+	if instance.Spec.MetricsEnabled == nil || *instance.Spec.MetricsEnabled {
+		ctrlResult, err = r.reconcileMetricsServices(ctx, helper, instance, serviceLabels)
+		if err != nil {
+			Log.Error(err, "Failed to reconcile metrics services")
+			return ctrlResult, err
+		} else if (ctrlResult != ctrl.Result{}) {
+			Log.Info("Metrics services reconciliation in progress")
+			return ctrlResult, nil
+		}
+	}
+
 	Log.Info("Reconciled Service successfully")
 	return ctrl.Result{}, nil
 }
@@ -566,6 +586,9 @@ func (r *OVNNorthdReconciler) generateServiceConfigMaps(
 	cmLabels := labels.GetLabels(instance, labels.GetGroupLabel(serviceName), map[string]string{})
 
 	templateParameters := make(map[string]interface{})
+	templateParameters["TLS"] = instance.Spec.TLS.Enabled()
+	templateParameters["OVN_METRICS_CERT_PATH"] = ovn_common.OVNMetricsCertPath
+	templateParameters["OVN_METRICS_KEY_PATH"] = ovn_common.OVNMetricsKeyPath
 
 	cms := []util.Template{
 		// ScriptsConfigMap
@@ -577,6 +600,253 @@ func (r *OVNNorthdReconciler) generateServiceConfigMaps(
 			Labels:        cmLabels,
 			ConfigOptions: templateParameters,
 		},
+		// ConfigConfigMap for network exporter
+		{
+			Name:          fmt.Sprintf("%s-config", instance.Name),
+			Namespace:     instance.Namespace,
+			Type:          util.TemplateTypeConfig,
+			InstanceType:  instance.Kind,
+			Labels:        cmLabels,
+			ConfigOptions: templateParameters,
+		},
 	}
 	return configmap.EnsureConfigMaps(ctx, h, instance, cms, envVars)
+}
+
+// reconcileMetricsServices creates individual metrics services per pod
+func (r *OVNNorthdReconciler) reconcileMetricsServices(
+	ctx context.Context,
+	helper *helper.Helper,
+	instance *ovnv1.OVNNorthd,
+	serviceLabels map[string]string,
+) (ctrl.Result, error) {
+	Log := r.GetLogger(ctx)
+
+	// List running pods for this OVN Northd instance
+	podList := &corev1.PodList{}
+	listOpts := []client.ListOption{
+		client.InNamespace(instance.Namespace),
+		client.MatchingLabels(map[string]string{
+			common.AppSelector: ovnv1.ServiceNameOVNNorthd,
+		}),
+	}
+	err := r.Client.List(ctx, podList, listOpts...)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	// Get running pods (exclude terminating pods)
+	runningPods := make([]*corev1.Pod, 0, len(podList.Items))
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		isTerminating := pod.DeletionTimestamp != nil
+		if pod.Status.Phase == corev1.PodRunning && !isTerminating {
+			runningPods = append(runningPods, pod)
+		}
+	}
+
+	// List all services in the namespace and filter for metrics services
+	existingServices := &corev1.ServiceList{}
+	serviceListOpts := []client.ListOption{
+		client.InNamespace(instance.Namespace),
+	}
+	err = r.Client.List(ctx, existingServices, serviceListOpts...)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list existing services: %w", err)
+	}
+
+	// Filter for our metrics services (those ending with "-metrics")
+	var metricsServices []corev1.Service
+	for _, svc := range existingServices.Items {
+		if strings.HasSuffix(svc.Name, "-metrics") {
+			// Check if this service has the right labels to be our metrics service
+			if svc.Labels != nil {
+				if svcType, exists := svc.Labels["type"]; exists && svcType == "metrics" {
+					// Check for service=ovn-northd label (based on the actual labels we see)
+					if serviceLabel, exists := svc.Labels["service"]; exists && serviceLabel == "ovn-northd" {
+						metricsServices = append(metricsServices, svc)
+					}
+				}
+			}
+		}
+	}
+
+	servicesToKeep := make(map[string]bool)
+
+	for _, pod := range runningPods {
+		podName := pod.Name
+		serviceName := fmt.Sprintf("%s-metrics", podName)
+		servicesToKeep[serviceName] = true
+
+		podService := ovnnorthd.MetricsServiceForPod(instance, serviceLabels, podName)
+
+		// Create/update the service
+		metricsService, err := service.NewService(
+			podService,
+			time.Duration(5)*time.Second,
+			nil,
+		)
+		if err != nil {
+			Log.Error(err, fmt.Sprintf("Failed to create metrics service for pod %s", podName))
+			continue
+		}
+		ctrlResult, err := metricsService.CreateOrPatch(ctx, helper)
+		if err != nil {
+			Log.Error(err, fmt.Sprintf("Failed to create or patch metrics service for pod %s", podName))
+			continue
+		} else if (ctrlResult != ctrl.Result{}) {
+			Log.Info(fmt.Sprintf("Metrics service creation in progress for pod %s", podName))
+			return ctrlResult, nil
+		}
+
+		// Create endpoints for this service pointing to the specific pod
+		err = r.createServiceEndpoints(ctx, instance, podName, pod, Log)
+		if err != nil {
+			Log.Error(err, fmt.Sprintf("Failed to create endpoints for metrics service %s", podName))
+			continue
+		}
+
+		Log.Info(fmt.Sprintf("Successfully reconciled metrics service %s-metrics for pod %s", podName, podName))
+	}
+
+	// Clean up services and endpoints for pods that no longer exist
+	for i := range metricsServices {
+		svc := &metricsServices[i]
+		if !servicesToKeep[svc.Name] {
+			Log.Info(fmt.Sprintf("Deleting metrics service %s (pod no longer exists)", svc.Name))
+
+			// Delete the endpoints first
+			endpoints := &corev1.Endpoints{}
+			err = r.Client.Get(ctx, types.NamespacedName{Name: svc.Name, Namespace: svc.Namespace}, endpoints)
+			if err == nil {
+				err = r.Client.Delete(ctx, endpoints)
+				if err != nil && !k8s_errors.IsNotFound(err) {
+					Log.Error(err, fmt.Sprintf("Failed to delete endpoints %s", svc.Name))
+				} else {
+					Log.Info(fmt.Sprintf("Deleted endpoints %s", svc.Name))
+				}
+			} else if !k8s_errors.IsNotFound(err) {
+				Log.Error(err, fmt.Sprintf("Failed to get endpoints %s for deletion", svc.Name))
+			}
+
+			// Delete the service
+			err = r.Client.Delete(ctx, svc)
+			if err != nil && !k8s_errors.IsNotFound(err) {
+				Log.Error(err, fmt.Sprintf("Failed to delete metrics service %s", svc.Name))
+			} else {
+				Log.Info(fmt.Sprintf("Deleted metrics service %s", svc.Name))
+			}
+		}
+	}
+
+	// Also clean up any orphaned endpoints that might exist without corresponding services
+	allEndpoints := &corev1.EndpointsList{}
+	endpointsListOpts := []client.ListOption{
+		client.InNamespace(instance.Namespace),
+	}
+	err = r.Client.List(ctx, allEndpoints, endpointsListOpts...)
+	if err != nil {
+		Log.Error(err, "Failed to list existing endpoints for cleanup")
+	} else {
+		for i := range allEndpoints.Items {
+			ep := &allEndpoints.Items[i]
+			// Check if this is a metrics endpoint by name pattern and labels
+			if strings.HasSuffix(ep.Name, "-metrics") && ep.Labels != nil {
+				if epType, exists := ep.Labels["type"]; exists && epType == "metrics" {
+					if serviceLabel, exists := ep.Labels["service"]; exists && serviceLabel == "ovn-northd" {
+						if !servicesToKeep[ep.Name] {
+							Log.Info(fmt.Sprintf("Deleting orphaned endpoints %s", ep.Name))
+							err = r.Client.Delete(ctx, ep)
+							if err != nil && !k8s_errors.IsNotFound(err) {
+								Log.Error(err, fmt.Sprintf("Failed to delete orphaned endpoints %s", ep.Name))
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// createServiceEndpoints creates endpoints for a metrics service pointing to a specific pod
+func (r *OVNNorthdReconciler) createServiceEndpoints(
+	ctx context.Context,
+	instance *ovnv1.OVNNorthd,
+	podName string,
+	pod *corev1.Pod,
+	Log logr.Logger,
+) error {
+	serviceName := fmt.Sprintf("%s-metrics", podName)
+
+	// Create endpoints object pointing to this specific pod
+	endpoints := &corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: instance.Namespace,
+			Labels: map[string]string{
+				"type":             "metrics",
+				"pod":              podName,
+				common.AppSelector: ovnv1.ServiceNameOVNNorthd,
+			},
+		},
+		Subsets: []corev1.EndpointSubset{},
+	}
+
+	// Only add endpoint if pod has an IP and is running
+	if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
+		endpoints.Subsets = []corev1.EndpointSubset{
+			{
+				Addresses: []corev1.EndpointAddress{
+					{
+						IP: pod.Status.PodIP,
+						TargetRef: &corev1.ObjectReference{
+							Kind:      "Pod",
+							Name:      pod.Name,
+							Namespace: pod.Namespace,
+							UID:       pod.UID,
+						},
+					},
+				},
+				Ports: []corev1.EndpointPort{
+					{
+						Name:     "metrics",
+						Port:     1981,
+						Protocol: corev1.ProtocolTCP,
+					},
+				},
+			},
+		}
+	}
+
+	// Set controller reference
+	err := controllerutil.SetControllerReference(instance, endpoints, r.Scheme)
+	if err != nil {
+		return fmt.Errorf("failed to set controller reference for endpoints %s: %w", serviceName, err)
+	}
+
+	// Create or update endpoints
+	foundEndpoints := &corev1.Endpoints{}
+	err = r.Client.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: instance.Namespace}, foundEndpoints)
+	if err != nil && k8s_errors.IsNotFound(err) {
+		// Create new endpoints
+		err = r.Client.Create(ctx, endpoints)
+		if err != nil {
+			return fmt.Errorf("failed to create endpoints for service %s: %w", serviceName, err)
+		}
+		Log.Info(fmt.Sprintf("Created endpoints for service %s", serviceName))
+	} else if err != nil {
+		return fmt.Errorf("failed to get endpoints for service %s: %w", serviceName, err)
+	} else {
+		// Update existing endpoints
+		foundEndpoints.Subsets = endpoints.Subsets
+		err = r.Client.Update(ctx, foundEndpoints)
+		if err != nil {
+			return fmt.Errorf("failed to update endpoints for service %s: %w", serviceName, err)
+		}
+		Log.Info(fmt.Sprintf("Updated endpoints for service %s", serviceName))
+	}
+
+	return nil
 }
