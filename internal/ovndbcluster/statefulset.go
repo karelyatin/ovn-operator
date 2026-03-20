@@ -81,7 +81,11 @@ func StatefulSet(
 			"/usr/bin/pidof", "ovsdb-server",
 		},
 	}
-	readinessProbe.Exec = livenessProbe.Exec
+	readinessProbe.Exec = &corev1.ExecAction{
+		Command: []string{
+			"/usr/local/bin/container-scripts/ovndb_readiness.sh",
+		},
+	}
 	startupProbe.Exec = livenessProbe.Exec
 
 	preStopCmd = []string{
