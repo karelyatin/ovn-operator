@@ -47,10 +47,10 @@ fi
 # extra_args after --
 set /usr/share/ovn/scripts/ovn-ctl --no-monitor
 
+# Election timer (initial value; runtime changes handled by operator)
 set "$@" --db-${DB_TYPE}-election-timer={{ .OVN_ELECTION_TIMER }}
 set "$@" --db-${DB_TYPE}-cluster-local-addr=$(hostname).{{ .SERVICE_NAME }}.${NAMESPACE}.svc.cluster.local
 set "$@" --db-${DB_TYPE}-cluster-local-port=${RAFT_PORT}
-set "$@" --db-${DB_TYPE}-probe-interval-to-active={{ .OVN_PROBE_INTERVAL_TO_ACTIVE }}
 set "$@" --db-${DB_TYPE}-addr=${DB_ADDR}
 set "$@" --db-${DB_TYPE}-port=${DB_PORT}
 {{- if .TLS }}
@@ -65,7 +65,7 @@ set "$@" --db-${DB_TYPE}-cluster-local-proto=tcp
 set "$@" --db-${DB_TYPE}-cluster-remote-proto=tcp
 {{- end }}
 
-# log to console
+# log to console (initial log level; runtime changes handled by operator)
 set "$@" --ovn-${DB_TYPE}-log=-vconsole:{{ .OVN_LOG_LEVEL }}
 
 # if server attempts to log to file, ignore
@@ -125,28 +125,24 @@ if [[ "$(hostname)" == "{{ .SERVICE_NAME }}-0" ]]; then
 {{- end }}
     ${CTLCMD} set-connection ${DB_SCHEME}:${DB_PORT}:${DB_ADDR}
 
-    # OVN does not support setting inactivity-probe through --remote cli arg so
-    # we have to set it after database is up.
-    #
-    # In theory, ovsdb.local-config(5) could be used to configure inactivity
-    # probe using a local ovsdb-server. But the future of this database is
-    # unclear, and it was largely abandoned by the community in mid-flight, so
-    # no tools exist to configure connections using this database. It may even
-    # be that this scheme will be abandoned in the future, because its features
-    # are covered by ovs text config file support added in latest ovs releases.
-    #
-    # TODO: Consider migrating inactivity probe setting  to config files when
-    # we update to ovs 3.3. See --config-file in ovsdb-server(1) for more
-    # details.
+    # Set initial connection and inactivity probe
+    # NOTE: Updates to inactivity probe are handled at runtime via the operator's
+    # reconcileRuntimeConfig() function to allow changes without pod restarts
     while [ "$(${CTLCMD} get connection . inactivity_probe)" != "{{ .OVN_INACTIVITY_PROBE }}" ]; do
         ${CTLCMD} --inactivity-probe={{ .OVN_INACTIVITY_PROBE }} set-connection ${DB_SCHEME}:${DB_PORT}:${DB_ADDR}
     done
     ${CTLCMD} list connection
 
+
     # The daemon is no longer needed, kill it
     kill $(cat $OVN_RUNDIR/ovn-${DB_TYPE}ctl.pid)
     unset OVN_${DB_TYPE^^}_DAEMON
 fi
+
+# NOTE: Election timer configuration has been moved to runtime Jobs
+# to avoid unnecessary pod restarts when election timer changes.
+# The election timer will be configured by the operator via Kubernetes Jobs
+# after the cluster is ready.
 
 # Check and perform database conversion if needed
 # This can be cleaned up once https://redhat.atlassian.net/browse/FDP-3108 is fixed
@@ -154,5 +150,8 @@ check_and_convert_db
 
 wait_for_ovsdb_tool
 trap - EXIT
+
+# Start background process to monitor for runtime configuration changes
+(/usr/local/bin/container-scripts/monitor-runtime-config.sh &) || true
 
 wait

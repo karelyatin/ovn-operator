@@ -13,6 +13,8 @@ limitations under the License.
 package ovndbcluster
 
 import (
+	"fmt"
+
 	topologyv1 "github.com/openstack-k8s-operators/infra-operator/apis/topology/v1beta1"
 	"github.com/openstack-k8s-operators/lib-common/modules/common"
 	"github.com/openstack-k8s-operators/lib-common/modules/common/affinity"
@@ -116,6 +118,27 @@ func StatefulSet(
 	// create Volume and VolumeMounts
 	volumes := GetDBClusterVolumes(instance.Name)
 	volumeMounts := GetDBClusterVolumeMounts(instance.Name + PVCSuffixEtcOVN)
+
+	// Add runtime config signal volume for monitoring configuration changes
+	runtimeConfigVolume := corev1.Volume{
+		Name: "runtime-config-signal",
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: fmt.Sprintf("%s-runtime-config-signal", serviceName),
+				},
+				Optional: ptr.To(true), // Make optional in case ConfigMap doesn't exist yet
+			},
+		},
+	}
+	volumes = append(volumes, runtimeConfigVolume)
+
+	runtimeConfigVolumeMount := corev1.VolumeMount{
+		Name:      "runtime-config-signal",
+		MountPath: "/etc/runtime-config",
+		ReadOnly:  true,
+	}
+	volumeMounts = append(volumeMounts, runtimeConfigVolumeMount)
 
 	// add CA bundle if defined
 	if instance.Spec.TLS.CaBundleSecretName != "" {

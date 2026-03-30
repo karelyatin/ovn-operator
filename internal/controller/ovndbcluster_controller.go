@@ -562,6 +562,7 @@ func (r *OVNDBClusterReconciler) reconcileNormal(ctx context.Context, instance *
 	// create Configmap required for dbcluster input
 	// - %-config configmap holding minimal dbcluster config required to get the service up
 	//
+	// Create ConfigMaps with ALL parameters included for setup script (pods will use these)
 	err = r.generateServiceConfigMaps(ctx, helper, instance, &configMapVars, serviceName)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
@@ -573,11 +574,20 @@ func (r *OVNDBClusterReconciler) reconcileNormal(ctx context.Context, instance *
 		return ctrl.Result{}, err
 	}
 
+	// Create SEPARATE environment variables for hash calculation WITHOUT runtime-configurable parameters
+	// This ensures election timer, log level, and inactivity probe changes don't trigger pod restarts
+	hashConfigMapVars := make(map[string]env.Setter)
+	err = r.generateServiceConfigMapsForHash(ctx, helper, instance, &hashConfigMapVars, serviceName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	//
 	// create hash over all the different input resources to identify if any those changed
 	// and a restart/recreate is required.
+	// NOTE: We use hashConfigMapVars which excludes election timer to prevent unnecessary pod restarts
 	//
-	inputHash, err := r.createHashOfInputHashes(ctx, instance, configMapVars)
+	inputHash, err := r.createHashOfInputHashes(ctx, instance, hashConfigMapVars)
 	if err != nil {
 		instance.Status.Conditions.Set(condition.FalseCondition(
 			condition.ServiceConfigReadyCondition,
@@ -660,6 +670,28 @@ func (r *OVNDBClusterReconciler) reconcileNormal(ctx context.Context, instance *
 	stateful := sfset.GetStatefulSet()
 	if stateful.Generation == stateful.Status.ObservedGeneration {
 		instance.Status.ReadyCount = stateful.Status.ReadyReplicas
+	}
+
+	// Create runtime config signal ConfigMap (always create, even on initial deployment)
+	err = ovndbcluster.UpdateRuntimeConfigSignal(ctx, r.Client, instance, serviceName)
+	if err != nil {
+		Log.Error(err, "Failed to create/update runtime configuration signal")
+		return ctrl.Result{}, err
+	}
+
+	// Handle runtime parameter configuration without pod restart using exec
+	// Only run runtime config detection when StatefulSet is stable (generation == observedGeneration)
+	if instance.Status.ReadyCount > 0 && stateful.Generation == stateful.Status.ObservedGeneration {
+		err = r.reconcileRuntimeConfig(ctx, helper, instance, serviceLabels, serviceName)
+		if err != nil {
+			instance.Status.Conditions.Set(condition.FalseCondition(
+				condition.ServiceConfigReadyCondition,
+				condition.ErrorReason,
+				condition.SeverityWarning,
+				condition.ServiceConfigReadyErrorMessage,
+				err.Error()))
+			return ctrl.Result{}, err
+		}
 	}
 
 	// verify if network attachment matches expectations
@@ -1112,6 +1144,46 @@ func (r *OVNDBClusterReconciler) deleteExternalConfigMaps(
 	return nil
 }
 
+// reconcileRuntimeConfig - handle runtime configuration without pod restart
+func (r *OVNDBClusterReconciler) reconcileRuntimeConfig(
+	ctx context.Context,
+	h *helper.Helper,
+	instance *ovnv1.OVNDBCluster,
+	serviceLabels map[string]string,
+	serviceName string,
+) error {
+	Log := r.GetLogger(ctx)
+
+	// Calculate runtime configuration hash for parameters that can be changed without pod restart
+	runtimeConfigData := map[string]interface{}{
+		"ElectionTimer":   instance.Spec.ElectionTimer,
+		"InactivityProbe": instance.Spec.InactivityProbe,
+		"LogLevel":        instance.Spec.LogLevel,
+		"DBType":          instance.Spec.DBType,
+		"TLS":             instance.Spec.TLS.Enabled(),
+	}
+
+	runtimeConfigHash, err := util.ObjectHash(runtimeConfigData)
+	if err != nil {
+		return err
+	}
+
+	// Track runtime configuration separately to avoid pod restarts
+	runtimeConfigHashKey := "OvnDBClusterRuntimeConfigHash"
+	currentRuntimeConfigHash := instance.Status.Hash[runtimeConfigHashKey]
+
+	// Only update hash tracking if runtime parameters have changed
+	if runtimeConfigHash != currentRuntimeConfigHash {
+		Log.Info(fmt.Sprintf("Runtime configuration changed. Old hash: %s, New hash: %s", currentRuntimeConfigHash, runtimeConfigHash))
+
+		// Update the hash - the ConfigMap is already updated in the main reconcile loop
+		instance.Status.Hash[runtimeConfigHashKey] = runtimeConfigHash
+		Log.Info(fmt.Sprintf("Runtime configuration hash updated: %s", runtimeConfigHash))
+	}
+
+	return nil
+}
+
 // generateServiceConfigMaps - create create configmaps which hold service configuration
 func (r *OVNDBClusterReconciler) generateServiceConfigMaps(
 	ctx context.Context,
@@ -1135,9 +1207,11 @@ func (r *OVNDBClusterReconciler) generateServiceConfigMaps(
 		templateParameters["DB_PORT"] = ovndbcluster.DbPortSB
 		templateParameters["RAFT_PORT"] = ovndbcluster.RaftPortSB
 	}
+	// NOTE: Runtime-configurable parameters are included for initial cluster setup
+	// but changes are handled at runtime via reconcileRuntimeConfig() to avoid pod restarts
 	templateParameters["OVN_ELECTION_TIMER"] = instance.Spec.ElectionTimer
 	templateParameters["OVN_INACTIVITY_PROBE"] = instance.Spec.InactivityProbe
-	templateParameters["OVN_PROBE_INTERVAL_TO_ACTIVE"] = instance.Spec.ProbeIntervalToActive
+	// NOTE: ProbeIntervalToActive is deprecated and not used in RAFT clustered deployments
 	templateParameters["TLS"] = instance.Spec.TLS.Enabled()
 	templateParameters["OVNDB_CERT_PATH"] = ovn_common.OVNDbCertPath
 	templateParameters["OVNDB_KEY_PATH"] = ovn_common.OVNDbKeyPath
@@ -1171,6 +1245,65 @@ func (r *OVNDBClusterReconciler) generateServiceConfigMaps(
 		})
 	}
 	return configmap.EnsureConfigMaps(ctx, h, instance, cms, envVars)
+}
+
+// generateServiceConfigMapsForHash - create configmap environment variables for hash calculation
+// This excludes election timer to prevent unnecessary pod restarts when only election timer changes
+func (r *OVNDBClusterReconciler) generateServiceConfigMapsForHash(
+	ctx context.Context,
+	h *helper.Helper,
+	instance *ovnv1.OVNDBCluster,
+	envVars *map[string]env.Setter,
+	serviceName string,
+) error {
+	// Create template parameters excluding runtime-configurable parameters for hash calculation
+	templateParameters := make(map[string]any)
+
+	// Include only parameters that require pod restart when changed
+	templateParameters["SERVICE_NAME"] = serviceName
+	templateParameters["NAMESPACE"] = instance.GetNamespace()
+	templateParameters["DB_TYPE"] = strings.ToLower(instance.Spec.DBType)
+	templateParameters["DB_PORT"] = ovndbcluster.DbPortNB
+	templateParameters["RAFT_PORT"] = ovndbcluster.RaftPortNB
+	if instance.Spec.DBType == ovnv1.SBDBType {
+		templateParameters["DB_PORT"] = ovndbcluster.DbPortSB
+		templateParameters["RAFT_PORT"] = ovndbcluster.RaftPortSB
+	}
+	// NOTE: Runtime-configurable parameters are intentionally excluded from hash calculation
+	// to prevent unnecessary pod restarts. These are handled by reconcileRuntimeConfig():
+	// - OVN_ELECTION_TIMER: Configured via ovs-appctl cluster/change-election-timer
+	// - OVN_INACTIVITY_PROBE: Configured via ovn-ctl --inactivity-probe set-connection
+	// - OVN_LOG_LEVEL: Configured via ovn-appctl vlog/set
+	// - OVN_PROBE_INTERVAL_TO_ACTIVE: Deprecated (not used in RAFT clusters)
+	templateParameters["TLS"] = instance.Spec.TLS.Enabled()
+	templateParameters["OVNDB_CERT_PATH"] = ovn_common.OVNDbCertPath
+	templateParameters["OVNDB_KEY_PATH"] = ovn_common.OVNDbKeyPath
+	templateParameters["OVNDB_CACERT_PATH"] = ovn_common.OVNDbCaCertPath
+	templateParameters["OVN_METRICS_CERT_PATH"] = ovn_common.OVNMetricsCertPath
+	templateParameters["OVN_METRICS_KEY_PATH"] = ovn_common.OVNMetricsKeyPath
+
+	cms := []util.Template{
+		// ScriptsConfigMap for hash calculation (without election timer)
+		{
+			Name:          fmt.Sprintf("%s-scripts-hash", instance.Name),
+			Namespace:     instance.Namespace,
+			Type:          util.TemplateTypeScripts,
+			InstanceType:  instance.Kind,
+			ConfigOptions: templateParameters,
+		},
+	}
+
+	// Only generate environment variables for hash calculation, don't create actual ConfigMaps
+	// Just calculate the template hash for environment variables used in main hash calculation
+	for _, cm := range cms {
+		hash, err := util.ObjectHash(cm.ConfigOptions)
+		if err != nil {
+			return err
+		}
+		(*envVars)[cm.Name] = env.SetValue(hash)
+	}
+
+	return nil
 }
 
 // createHashOfInputHashes - creates a hash of hashes which gets added to the resources which requires a restart
